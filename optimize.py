@@ -29,10 +29,6 @@ def obj_func_wrapper(obj_func, position):
 
 def random_perturbation(protein_structure, masses, proposal_std):
     # Apply a small random perturbation to both positions and masses
-    mass_res= np.array([1.28406329, 0.16827993, 0.32325743, 1.79710838, 1.21285812,
-       0.0183941 , 0.20294309, 1.32700354, 0.01012317, 0.3216161 ,
-       1.09746758, 1.3837904 , 1.30392252, 0.44853862, 1.42435844,
-       0.47449817, 0.6507994 , 1.49298281, 1.2992658 , 1.69844682])
     mass_res = list(mass_residue("7cv0.pdb").values())[:]
     hull = ConvexHull(protein_structure)
     vertice = hull.vertices
