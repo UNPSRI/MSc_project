@@ -10,7 +10,7 @@ import matplotlib.animation as animation
 import random
 from Bio import PDB
 import numpy as np
-
+from utilities import marsaglia_polar
 warnings.filterwarnings('ignore')
 
 class ObjFuncModule(nn.Module):
