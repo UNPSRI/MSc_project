@@ -18,192 +18,112 @@ class ObjFuncModule(nn.Module):
         super(ObjFuncModule, self).__init__()
         self.obj_func = obj_func
 
-    def forward(self, position, mass):
+    def forward(self, position):
         # Convert tensor to numpy, apply the objective function, then convert back to tensor
-        result = self.obj_func(position.cpu().numpy(), mass.cpu().numpy())
-        return torch.tensor(result, dtype=torch.float32).cuda()
-
-
-def obj_func_wrapper(obj_func, position):
-    return torch.tensor(obj_func(position.cpu().numpy()), dtype=torch.float32).cuda()
-
-def random_perturbation(protein_structure, masses, proposal_std):
+        result = self.obj_func(position)
+        return result
+    
+def marsaglia_method(dim):
+    if dim == 2:
+        while True:
+            u1 = random.uniform(-1, 1)
+            u2 = random.uniform(-1, 1)
+            s = u1**2 + u2**2
+            if s >= 1:
+                continue
+        
+            #print (s)
+            factor = np.sqrt(-2.0 * np.log(s) / s)
+            z0 = u1 * factor
+            z1 = u2 * factor
+            return np.array( [ z0, z1 ] )
+        
+    if dim == 3:
+        while True:
+            u1 = random.uniform(-1, 1)
+            u2 = random.uniform(-1, 1)
+            s = u1**2 + u2**2
+            if s >= 1:
+                continue
+            z0 = 2 * u1 * np.sqrt( 1 - u1**2 - u2**2 )
+            z1 = 2 * u2 * np.sqrt( 1 - u1**2 - u2**2 )
+            z2 = 1 - 2*( u1**2 + u2**2 )
+            
+            return np.array( [ z0, z1, z2 ] )
+            
+def random_perturbation(protein_structure, device):
     # Apply a small random perturbation to both positions and masses
-    mass_res = list(mass_residue("7cv0.pdb").values())[:]
-    hull = ConvexHull(protein_structure)
-    vertice = hull.vertices
-    #print (vertice)
-    random_amino = random.choice(vertice)
-    #print (random_amino)
+    random_amino = random.choice(range(len(protein_structure)))
     perturbed_structure = protein_structure.clone()
-    perturbed = torch.normal(0, 0.1, size=(protein_structure.shape[1],))
-    perturbed_structure[random_amino] = protein_structure[random_amino] + perturbed
-    #print ((protein_structure == perturbed_structure).all())
-    perturbed_masses = masses.clone()
-    perturbed_masses[random_amino] = masses[random_amino] + random.choice(mass_res)
+    perturbed = torch.tensor(marsaglia_method(protein_structure.shape[1]),device=device, dtype=torch.float64)
+    perturbed *= np.random.rand()
+    perturbed_structure[random_amino] = protein_structure[random_amino].clone() + perturbed
 
-    return perturbed_structure, np.clip(perturbed_masses, 0.1, 10), perturbed  # Ensure masses remain positive
+    return perturbed_structure 
 
-def metropolis_monte_carlo_backbone(obj_func, initial_position, initial_backbone, initial_mass, \
-                                       steps, proposal_std, pdb_filename, temperature, gpu_ids=None):
-    # Set default GPU device
-    if gpu_ids is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
-    initial_position = torch.tensor(initial_position, device=device, dtype=torch.float32)
-    current_position = torch.tensor(initial_position, device=device, dtype=torch.float32)
-    current_backbone = torch.tensor(initial_backbone, device=device, dtype=torch.float32)
-    current_mass = torch.tensor(initial_mass, device=device, dtype=torch.float32)
-    temperature = torch.tensor(temperature, device=device, dtype=torch.float32)
+def simulated_annealing(obj_func, initial_structure, initial_temp, final_temp, alpha, \
+                        max_iterations):
     
+    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
+    current_structure = torch.tensor(initial_structure, device=device, dtype=torch.float64, requires_grad=False)
+
     # Wrapping the objective function in a module and parallelizing it
-    obj_func_module = ObjFuncModule(obj_func)
-    if gpu_ids is not None:
-        obj_func_parallel = torch.nn.DataParallel(obj_func_module, device_ids=gpu_ids).to(device)
-    else:
-        obj_func_parallel = torch.nn.DataParallel(obj_func_module).to(device)
+    obj_func_module = ObjFuncModule(obj_func).to(device)
+    obj_func_parallel = torch.nn.DataParallel(obj_func_module).to(device)
         
-    current_loss = obj_func_parallel(current_position,current_mass)
-
-    best_position = current_position.clone()
-    best_loss = current_loss.clone()
-    best_backbone = current_backbone.clone()
-
-    positions = [current_position.cpu().numpy()]
-    values = [current_loss.cpu().item()]
+        
+    current_loss = obj_func_parallel(current_structure.cpu().numpy())
+    temperature = initial_temp
+    #torch.tensor(initial_temp, device=device, dtype=torch.float64, requires_grad=False)
+    steps = 1
+    iteration = 0
+    position = [current_structure]
+    values = [current_loss]
+    accept = 0
     start_time = time.time()
-
-    for step in range(steps):
-        proposed_position, proposed_mass, perturbed = random_perturbation(current_position, current_mass, proposal_std)
-        proposed_loss = obj_func_parallel(proposed_position.clone(),proposed_mass.clone() )
-        proposed_backbone = current_backbone + perturbed
-        delta_loss = torch.tensor(proposed_loss - current_loss, device=device)
-
-        if delta_loss < 0 \
-                or torch.rand(1, dtype=torch.float32, device=device) < torch.exp(- delta_loss / temperature):
-            current_position = proposed_position
-            current_loss = proposed_loss
-            current_backbone = proposed_backbone
-
+    while temperature > final_temp and iteration < max_iterations:
         
-            best_loss = current_loss.clone()
-
-        positions.append(current_position.cpu().numpy())
-        values.append(current_loss.cpu().item())
+        
+        # Metropolis criterion
+        for step in range (steps):
+            new_structure = random_perturbation(current_structure, device)
+            new_loss = obj_func_parallel(new_structure.cpu().numpy())
+            # Calculate loss difference
+            delta_loss = new_loss - current_loss
+            if delta_loss < 0 or np.random.rand() < np.exp(-delta_loss / temperature):
+                accept += 1
+                current_structure = new_structure
+                current_loss = new_loss
+        
         step_end_time = time.time()
         
-        if step % 10 == 0 and step > 0:  # Print every 10 steps
+        # Decrease the temperature
+        temperature *= alpha
+        iteration += 1
+        
+        # Print progress (optional)
+        if iteration % 100 == 0 and iteration > 0:  # Print every 10 steps
+            values.append(current_loss)
+            position.append(current_structure)
             elapsed_time = step_end_time - start_time
-            steps_remaining = steps - step
-            estimated_total_time = elapsed_time / step * steps
+            steps_remaining = max_iterations - iteration
+            estimated_total_time = elapsed_time / iteration * max_iterations
             estimated_remaining_time = estimated_total_time - elapsed_time
-            sys.stdout.write(f"\rStep {step}/{steps} - Elapsed Time: {elapsed_time:.2f}s, "
+            sys.stdout.write(f"\rStep {iteration}/{max_iterations} - Elapsed Time: {elapsed_time:.2f}s, "
                   f"Estimated Total Time: {estimated_total_time:.2f}s, "
                   f"Estimated Remaining Time: {estimated_remaining_time:.2f}s                              ")
-            sys.stdout.write(f"Minimum lost: {best_loss: 2f} ")
+            sys.stdout.write(f"Best Loss = {current_loss}, acceptance {accept/iteration}")
             sys.stdout.flush()
-            
+
+
+
+        
+        
     total_time = time.time() - start_time
     print(f"Total Time: {total_time:.2f}s")
-
-    return current_position.cpu().numpy(), best_loss.cpu().item(), current_backbone.cpu().numpy()
+        
         
 
-def metropolis_monte_carlo_backbone_anim(obj_func, initial_position, initial_backbone, initial_mass, \
-                                       steps, proposal_std, pdb_filename, temperature, gpu_ids=None):
-    # Set default GPU device
-    if gpu_ids is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
-    initial_position = torch.tensor(initial_position, device=device, dtype=torch.float32)
-    current_position = torch.tensor(initial_position, device=device, dtype=torch.float32)
-    current_backbone = torch.tensor(initial_backbone, device=device, dtype=torch.float32)
-    current_mass = torch.tensor(initial_mass, device=device, dtype=torch.float32)
-    temperature = torch.tensor(temperature, device=device, dtype=torch.float32)
-    
-    # Wrapping the objective function in a module and parallelizing it
-    obj_func_module = ObjFuncModule(obj_func)
-    if gpu_ids is not None:
-        obj_func_parallel = torch.nn.DataParallel(obj_func_module, device_ids=gpu_ids).to(device)
-    else:
-        obj_func_parallel = torch.nn.DataParallel(obj_func_module).to(device)
-        
-    current_loss = obj_func_parallel(current_position,current_mass)
-
-    best_position = current_position.clone()
-    best_loss = current_loss.clone()
-    best_backbone = current_backbone.clone()
-
-    positions = [current_position.cpu().numpy()]
-    values = [current_loss.cpu().item()]
-    start_time = time.time()
-
-    fig, ax = plt.subplots()
-    scatter = ax.scatter(current_position.cpu().numpy()[:, 0], current_position.cpu().numpy()[:, 1])
-    hull_lines = []
-    hull_vertices = ax.plot([], [], 'ro', label='Hull Vertices')[0]
-
-    ax.set_xlim(-10, 10)  # Set appropriate limits based on your data
-    ax.set_ylim(-10, 10)
-    
-    def update_plot(frame):
-        nonlocal current_position, current_loss, best_loss, current_backbone
-        proposed_position, proposed_mass, perturbed = random_perturbation(current_position, current_mass, proposal_std)
-        proposed_loss = obj_func_parallel(proposed_position.clone(),proposed_mass.clone() )
-        proposed_backbone = current_backbone + perturbed
-        delta_loss = torch.tensor(proposed_loss - current_loss, device=device)
-
-        if delta_loss < 0 \
-                or torch.rand(1, dtype=torch.float32, device=device) < torch.exp(- delta_loss / temperature):
-            current_position = proposed_position
-            current_loss = proposed_loss
-            current_backbone = proposed_backbone
-
-        
-            best_loss = current_loss.clone()
-
-        positions.append(current_position.cpu().numpy())
-        values.append(current_loss.cpu().item())
-        step_end_time = time.time()
-        
-        scatter.set_offsets(current_position.cpu().numpy())
-        ax.set_title(f"Step {frame+1}/{steps}, Loss: {current_loss.cpu().item():.2f}")
-        step = frame
-        if step % 10 == 0 and step > 0:  # Print every 10 steps
-            elapsed_time = step_end_time - start_time
-            steps_remaining = steps - step
-            estimated_total_time = elapsed_time / step * steps
-            estimated_remaining_time = estimated_total_time - elapsed_time
-            sys.stdout.write(f"\rStep {step}/{steps} - Elapsed Time: {elapsed_time:.2f}s, "
-                  f"Estimated Total Time: {estimated_total_time:.2f}s, "
-                  f"Estimated Remaining Time: {estimated_remaining_time:.2f}s                              ")
-            sys.stdout.write(f"Minimum lost: {best_loss: 2f} ")
-            sys.stdout.flush()
-            
-        for line in hull_lines:
-            line.remove()
-        hull_lines.clear()
-
-        hull = ConvexHull(current_position.cpu().numpy())
-        for simplex in hull.simplices:
-            line, = ax.plot(current_position.cpu().numpy()[simplex, 0], current_position.cpu().numpy()[simplex, 1], 'r-')
-            hull_lines.append(line)
-        hull_vertices.set_data(current_position.cpu().numpy()[hull.vertices, 0], current_position.cpu().numpy()[hull.vertices, 1])
-        
-        return scatter, *hull_lines, hull_vertices
-
-    ani = animation.FuncAnimation(fig, update_plot, frames=[i for i in range(steps)], blit=True, repeat=False)
-    
-    # Save the animation
-    #ani.save('monte_carlo_animation-3d.gif', writer='pillow', fps=10)
-    #plt.show()
-
-    total_time = time.time() - start_time
-    print(f"Total Time: {total_time:.2f}s")
-
-    return current_position.cpu().numpy(), best_loss.cpu().item(), current_backbone.cpu().numpy()
+    return current_structure, current_loss, values, position
 
